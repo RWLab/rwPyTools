@@ -282,7 +282,7 @@ def _default_cache_dir() -> Path:
 def _default_user_agent() -> str:
     from ._version import __version__
 
-    return f"rwpytools/{__version__} (+https://github.com/Robot-Wealth/rwPyTools)"
+    return f"rwpytools/{__version__} (+https://github.com/RWLab/rwPyTools)"
 
 
 def _int_env(env_var: str, override: int | None, default: int) -> int:

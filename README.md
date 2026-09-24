@@ -1,6 +1,6 @@
 # rwpytools
 
-[![CI](https://github.com/Robot-Wealth/rwPyTools/actions/workflows/ci.yml/badge.svg)](https://github.com/Robot-Wealth/rwPyTools/actions/workflows/ci.yml)
+[![CI](https://github.com/RWLab/rwPyTools/actions/workflows/ci.yml/badge.svg)](https://github.com/RWLab/rwPyTools/actions/workflows/ci.yml)
 
 The official Python client for the [Robot Wealth](https://robotwealth.com) research
 data API — the Python equivalent of [rwRTools](https://github.com/RWLab/rwRtools).

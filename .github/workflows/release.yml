@@ -19,7 +19,7 @@
 #
 # ONE-TIME SETUP:
 #   1. https://pypi.org/manage/account/publishing/ -> pending publisher:
-#        PyPI project: rwpytools | Owner: Robot-Wealth
+#        PyPI project: rwpytools | Owner: RWLab
 #        Repository: rwPyTools | Workflow: release.yml | Environment: pypi
 #   2. https://test.pypi.org/manage/account/publishing/ -> same, but
 #        Environment: testpypi

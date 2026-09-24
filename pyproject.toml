@@ -54,8 +54,8 @@ docs = [
 [project.urls]
 Homepage = "https://robotwealth.com"
 Documentation = "https://api.robotwealth.com/v1/docs"
-Issues = "https://github.com/Robot-Wealth/rwPyTools/issues"
-Source = "https://github.com/Robot-Wealth/rwPyTools"
+Issues = "https://github.com/RWLab/rwPyTools/issues"
+Source = "https://github.com/RWLab/rwPyTools"
 
 [tool.hatch.version]
 path = "src/rwpytools/_version.py"
