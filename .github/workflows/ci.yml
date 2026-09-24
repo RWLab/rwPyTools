@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_call:        # release.yml calls this, so nothing ships untested
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: ruff check src tests
+      - run: ruff format --check src tests
+      - run: mypy
+
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the floor declared in pyproject; test it and the current release.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        os: [ubuntu-latest]
+        include:
+          - { python-version: "3.12", os: macos-latest }
+          - { python-version: "3.12", os: windows-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: pip install -e ".[dev]"
+      # Every test runs against mocked HTTP; tests/conftest.py blocks real sockets.
+      - run: pytest
+
+  import-bare:
+    # `import rwpytools` must work from a plain `pip install .` — no dev or
+    # test extras. Easy to break by importing a test-only package (respx,
+    # pytest) from library code, so it is a gate.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install .
+      - run: python -c "import rwpytools; print(rwpytools.__version__)"
+      - name: fail if a dev/test dependency got pulled in
+        run: |
+          if pip show pytest respx >/dev/null 2>&1; then
+            echo "::error::a hard dependency on a dev/test package crept in"; exit 1
+          fi
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check --strict dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

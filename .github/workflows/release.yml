@@ -1,0 +1,178 @@
+# Publishing. Two channels, one workflow file.
+#
+#   merge to main  ->  TestPyPI, as <version>.dev<run_number>   (automatic)
+#   push a v* tag  ->  PyPI, as <version>                        (deliberate)
+#
+# WHY BOTH. PyPI is immutable: a version can be uploaded once, ever, and a
+# deleted one can never be reused. So a real release stays a deliberate act.
+# But that used to mean the entire publish path — OIDC, environments, artifact
+# validity — was only exercised at the moment it mattered most. The dev channel
+# fixes that: every merge to main proves the pipeline works end to end, at the
+# cost of TestPyPI version numbers, which are disposable.
+#
+# By the time you push a tag, the only thing that has never been tested is the
+# tag itself.
+#
+# Both channels live in THIS file on purpose. PyPI trusted publishing is keyed
+# on the workflow FILENAME, so a second workflow would need its own pending
+# publisher registered. One file, two environments, two registrations.
+#
+# ONE-TIME SETUP:
+#   1. https://pypi.org/manage/account/publishing/ -> pending publisher:
+#        PyPI project: rwpytools | Owner: Robot-Wealth
+#        Repository: rwPyTools | Workflow: release.yml | Environment: pypi
+#   2. https://test.pypi.org/manage/account/publishing/ -> same, but
+#        Environment: testpypi
+#   3. Repo Settings -> Environments -> create `pypi` and `testpypi`.
+#      Put required reviewers on `pypi` only. Leaving `testpypi` ungated is
+#      the point — an approval on every merge is the manual step we removed.
+#
+# TO RELEASE FOR REAL:
+#   1. bump __version__ in src/rwpytools/_version.py via a PR
+#   2. git tag v0.2.0 && git push origin v0.2.0
+#   3. approve the `pypi` environment when prompted
+#
+# A pre-release tag (v0.2.0rc1) goes to TestPyPI, not PyPI.
+
+name: Release
+
+on:
+  push:
+    branches: [main] # -> TestPyPI dev build
+    tags: ["v*"] # -> PyPI (or TestPyPI if a pre-release)
+  workflow_dispatch:
+    inputs:
+      testpypi_only:
+        description: "Force TestPyPI even for a tag"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never let two publishes race for the same version number.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: resolve version and channel
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      channel: ${{ steps.check.outputs.channel }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - id: check
+        run: |
+          set -euo pipefail
+          BASE=$(python -c "import re,pathlib; \
+            print(re.search(r'\"([^\"]+)\"', \
+            pathlib.Path('src/rwpytools/_version.py').read_text()).group(1))")
+
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            # A tag must agree with the source tree. This is what keeps a
+            # release deterministic: the artifact's version comes from the
+            # code, and the tag only selects which commit.
+            TAG="${GITHUB_REF_NAME#v}"
+            if [ "$TAG" != "$BASE" ]; then
+              echo "::error::tag v$TAG does not match _version.py ($BASE)"
+              exit 1
+            fi
+            VERSION="$BASE"
+            if [[ "$BASE" =~ (a|b|rc|dev)[0-9]*$ ]] || [ "${{ inputs.testpypi_only }}" = "true" ]; then
+              CHANNEL=testpypi
+            else
+              CHANNEL=pypi
+            fi
+          else
+            # Merge to main. PEP 440 dev release, ordered by run number so it is
+            # always unique and always sorts BELOW the eventual real release.
+            VERSION="${BASE}.dev${{ github.run_number }}"
+            CHANNEL=testpypi
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "::notice::publishing $VERSION to $CHANNEL"
+
+  ci:
+    needs: verify
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: [verify, ci]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: stamp the resolved version
+        # Only changes the file for dev builds; for a tag it rewrites the same
+        # value it already held, because `verify` proved they agree.
+        run: |
+          python - <<'PY'
+          import pathlib
+          p = pathlib.Path("src/rwpytools/_version.py")
+          p.write_text('__version__ = "${{ needs.verify.outputs.version }}"\n')
+          print(p.read_text())
+          PY
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check --strict dist/*
+      - name: artifact filenames must carry the resolved version
+        run: ls dist/ | grep -q "${{ needs.verify.outputs.version }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  testpypi:
+    needs: [verify, build]
+    if: needs.verify.outputs.channel == 'testpypi'
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi # deliberately ungated
+      url: https://test.pypi.org/p/rwpytools
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: dist, path: dist }
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          # A re-run of the same commit must not fail the workflow.
+          skip-existing: true
+
+  pypi:
+    needs: [verify, build]
+    if: needs.verify.outputs.channel == 'pypi'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi # gate this one with required reviewers
+      url: https://pypi.org/p/rwpytools
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: dist, path: dist }
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: [verify, pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: dist, path: dist }
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*
