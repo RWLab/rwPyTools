@@ -64,7 +64,7 @@ path = "src/rwpytools/_version.py"
 packages = ["src/rwpytools"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/rwpytools", "tests", "README.md", "LICENSE", "pyproject.toml"]
+include = ["/src/rwpytools", "/tests", "/README.md", "/LICENSE", "/pyproject.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -80,7 +80,7 @@ filterwarnings = [
 [tool.ruff]
 line-length = 100
 target-version = "py310"
-src = ["src", "tests"]
+src = ["src", "tests", "examples"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "N", "RUF", "SIM", "PT"]
@@ -98,7 +98,7 @@ strict = true
 # needed on one version is "unused" on the next. Don't fail on that.
 warn_unused_ignores = false
 warn_redundant_casts = true
-files = ["src/rwpytools"]
+files = ["src/rwpytools", "examples"]
 
 [[tool.mypy.overrides]]
 module = ["pyarrow.*", "respx.*"]

@@ -31,6 +31,8 @@ print(result.describe_route())
 df = result.df
 ```
 
+Runnable scripts for common tasks are in [`examples/`](examples/).
+
 ## Install
 
 ```bash
