@@ -8,10 +8,11 @@ fake API base URL so respx can intercept its requests.
 from __future__ import annotations
 
 import io
+import ipaddress
 import socket
 from collections.abc import Iterator
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 
 import pyarrow as pa
 import pyarrow.feather
@@ -26,6 +27,17 @@ class RealNetworkAccessError(RuntimeError):
     """A test tried to open a real network connection."""
 
 
+def _is_loopback(host: object) -> bool:
+    if not isinstance(host, str):
+        return False
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.split("%")[0]).is_loopback
+    except ValueError:
+        return False
+
+
 @pytest.fixture(autouse=True)
 def _no_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
     """Hard stop: no test may reach a real host, the rw-api included.
@@ -33,22 +45,37 @@ def _no_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
     respx intercepts at the httpx transport layer, above sockets, so mocked
     requests never get here. Anything that does — an unmocked route, a
     forgotten ``respx.mock`` — fails loudly instead of calling the network.
-    Local sockets (asyncio's self-pipe) are still allowed.
+
+    Loopback stays open: on Windows, asyncio's event loop builds its
+    self-pipe from a TCP connection to 127.0.0.1 (there are no AF_UNIX
+    socket pairs), so blocking loopback would break every event loop.
     """
 
-    def _blocked(*args: object, **kwargs: object) -> NoReturn:
-        raise RealNetworkAccessError(f"test attempted real network access: {args!r}")
+    def _blocked(target: object) -> NoReturn:
+        raise RealNetworkAccessError(f"test attempted real network access: {target!r}")
 
     real_connect = socket.socket.connect
+    real_create_connection = socket.create_connection
+    real_getaddrinfo = socket.getaddrinfo
 
-    def _guarded_connect(self: socket.socket, address: object) -> None:
-        if self.family in (socket.AF_INET, socket.AF_INET6):
+    def _guarded_connect(self: socket.socket, address: Any) -> None:
+        if self.family in (socket.AF_INET, socket.AF_INET6) and not _is_loopback(address[0]):
             _blocked(address)
-        real_connect(self, address)  # type: ignore[arg-type]
+        real_connect(self, address)
 
-    monkeypatch.setattr(socket, "getaddrinfo", _blocked)
-    monkeypatch.setattr(socket, "create_connection", _blocked)
+    def _guarded_create_connection(address: Any, *args: Any, **kwargs: Any) -> socket.socket:
+        if not _is_loopback(address[0]):
+            _blocked(address)
+        return real_create_connection(address, *args, **kwargs)
+
+    def _guarded_getaddrinfo(host: Any, *args: Any, **kwargs: Any) -> Any:
+        if host is not None and not _is_loopback(host):
+            _blocked(host)
+        return real_getaddrinfo(host, *args, **kwargs)
+
     monkeypatch.setattr(socket.socket, "connect", _guarded_connect)
+    monkeypatch.setattr(socket, "create_connection", _guarded_create_connection)
+    monkeypatch.setattr(socket, "getaddrinfo", _guarded_getaddrinfo)
 
 
 @pytest.fixture

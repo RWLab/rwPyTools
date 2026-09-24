@@ -248,3 +248,20 @@ def test_real_network_access_is_blocked() -> None:
         pytest.raises(RuntimeError, match="real network access"),
     ):
         sock.connect(("93.184.216.34", 443))
+
+
+def test_loopback_stays_open_for_the_windows_event_loop() -> None:
+    """On Windows asyncio's self-pipe is a TCP pair on 127.0.0.1 (the
+    fallback socketpair). The guard must allow it, or no event loop starts."""
+
+    import asyncio
+    import socket
+
+    left, right = socket._fallback_socketpair()  # type: ignore[attr-defined]
+    try:
+        left.sendall(b"x")
+        assert right.recv(1) == b"x"
+    finally:
+        left.close()
+        right.close()
+    assert asyncio.run(asyncio.sleep(0, result=1)) == 1
