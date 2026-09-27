@@ -23,6 +23,7 @@ import contextlib
 import dataclasses
 import datetime as _dt
 import logging
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -54,6 +55,15 @@ log = logging.getLogger(__name__)
 #: itself is behind, and refreshing again would change nothing.
 _NO_REFRESH = 10**6
 
+#: ``(path, size, date_column, start, end, symbol_column, symbols)`` --
+#: identifies one ``_read_object`` result. ``(path, size)`` stands in for the
+#: on-disk export's identity: it's the same pair ``BulkClient.fetch_one``
+#: already re-validates a cache entry against (a changed size means a
+#: changed export), so a stale entry can never outlive the file it read.
+_FrameCacheKey = tuple[
+    str, int, str | None, _dt.date | None, _dt.date | None, str | None, tuple[str, ...] | None
+]
+
 
 class AsyncSession:
     """The auto-routing engine shared by ``Client`` and ``AsyncClient``."""
@@ -70,6 +80,13 @@ class AsyncSession:
         self._bulk = bulk
         self._live = live
         self._today = today or _dt.date.today
+        # LRU of _read_object's own parsed-and-filtered results, keyed by
+        # _FrameCacheKey. See _read_object's own docstring for why this
+        # exists. Plain dict + move_to_end is safe under asyncio's
+        # single-threaded interleaving: a lookup/store never spans an
+        # ``await``, so two concurrent calls racing on the same key can at
+        # worst both miss and both compute (redundant, not incorrect).
+        self._frame_cache: OrderedDict[_FrameCacheKey, pd.DataFrame] = OrderedDict()
 
     # ---- planning -----------------------------------------------------------
 
@@ -408,7 +425,50 @@ class AsyncSession:
         symbols: list[str],
         per_symbol_files: bool,
     ) -> pd.DataFrame:
-        return await asyncio.to_thread(
+        """Read one cached export, filtered to ``window``/``symbols``.
+
+        For a bulk dataset without ``Template.YEAR`` (a single large export
+        spanning its whole date range, e.g. ``liquid_universe_prices``),
+        every call here re-reads and re-filters the *entire* on-disk export
+        via ``formats.read_frame`` -- there's no server-side or file-level
+        way to narrow what gets read for a non-templated export. A caller
+        that repeats an identical request (retrying after a partial
+        failure, or a caller that iterates windows itself specifically to
+        bound its own memory -- e.g. one calendar year at a time) pays that
+        full-export cost again on every repeat, in the same process, for a
+        result that hasn't changed. ``self._frame_cache`` (an LRU, size set
+        by ``ClientConfig.frame_cache_max_entries``) returns the identical
+        result instead of re-reading. Keyed by the export's own on-disk
+        identity (``path``, ``size``) plus the request shape, so a refreshed
+        export (new size) or a genuinely different request always misses.
+        """
+
+        effective_symbols = None if per_symbol_files else (symbols or None)
+        cache_key: _FrameCacheKey | None = None
+        if self._config.frame_cache_max_entries > 0:
+            cache_key = (
+                str(result.path),
+                result.size,
+                spec.date_column,
+                window.start,
+                window.end,
+                spec.symbol_column,
+                tuple(sorted(effective_symbols)) if effective_symbols else None,
+            )
+            cached = self._frame_cache.get(cache_key)
+            if cached is not None:
+                self._frame_cache.move_to_end(cache_key)
+                # Never hand back the cached object itself -- a caller that
+                # mutates its result in place (session.py's own _conform/
+                # _merge do, on the *live* half, not this bulk half, but a
+                # third-party caller of Client.get() might) must not corrupt
+                # what every future cache hit returns. A shallow copy is
+                # enough: it's a new DataFrame wrapper over the same
+                # (immutable-in-practice) underlying column arrays, so this
+                # costs far less than re-reading the export.
+                return cached.copy(deep=False)
+
+        frame = await asyncio.to_thread(
             formats.read_frame,
             result.path,
             object_name=result.object_name,
@@ -416,8 +476,14 @@ class AsyncSession:
             start=window.start,
             end=window.end,
             symbol_column=spec.symbol_column,
-            symbols=None if per_symbol_files else (symbols or None),
+            symbols=effective_symbols,
         )
+        if cache_key is not None:
+            self._frame_cache[cache_key] = frame
+            self._frame_cache.move_to_end(cache_key)
+            while len(self._frame_cache) > self._config.frame_cache_max_entries:
+                self._frame_cache.popitem(last=False)
+        return frame
 
     async def _read_live(
         self,

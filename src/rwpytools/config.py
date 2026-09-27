@@ -46,6 +46,7 @@ _ENV_BULK_TTL = "RWPYTOOLS_BULK_TTL"
 _ENV_LIVE_DIFF_MAX_DAYS = "RWPYTOOLS_LIVE_DIFF_MAX_DAYS"
 _ENV_LIVE_ONLY_WINDOW_DAYS = "RWPYTOOLS_LIVE_ONLY_WINDOW_DAYS"
 _ENV_RATE_LIMIT_WAIT = "RWPYTOOLS_RATE_LIMIT_WAIT"
+_ENV_FRAME_CACHE_MAX_ENTRIES = "RWPYTOOLS_FRAME_CACHE_MAX_ENTRIES"
 
 DEFAULT_API_BASE_URL = "https://api.robotwealth.com"
 DEFAULT_CACHE_MAX_BYTES = 10 * 1024 * 1024 * 1024  # 10 GiB on-disk cache cap.
@@ -75,6 +76,18 @@ DEFAULT_LIVE_ONLY_WINDOW_DAYS = 30
 #: Seconds to wait before retrying a 429 that carries no ``Retry-After``.
 #: rw-api's limits are per minute and it does not send the header.
 DEFAULT_RATE_LIMIT_WAIT = 20.0
+#: How many parsed-and-filtered ``AsyncSession._read_object`` results to keep
+#: in memory per ``Client``/``AsyncSession``, LRU-evicted. Session.get() calls
+#: formats.read_frame() fresh on every call -- for a bulk dataset without
+#: Template.YEAR (a single large export covering its whole date range, e.g.
+#: liquid_universe_prices), that means re-reading and re-filtering the same
+#: on-disk export from scratch for every distinct (or repeated) window a
+#: caller asks for, even seconds apart in the same process. A caller who
+#: repeats an identical (dataset, cell, window, symbols) request -- a retry
+#: after a partial failure, or a caller iterating windows itself to bound its
+#: own memory -- gets that exact result back without re-reading the export.
+#: 0 disables the cache entirely.
+DEFAULT_FRAME_CACHE_MAX_ENTRIES = 8
 
 
 def _mask_api_key(api_key: str) -> str:
@@ -126,6 +139,7 @@ class ClientConfig:
     live_diff_max_days: int = DEFAULT_LIVE_DIFF_MAX_DAYS
     live_only_window_days: int = DEFAULT_LIVE_ONLY_WINDOW_DAYS
     rate_limit_wait: float = DEFAULT_RATE_LIMIT_WAIT
+    frame_cache_max_entries: int = DEFAULT_FRAME_CACHE_MAX_ENTRIES
     user_agent: str = field(default_factory=lambda: _default_user_agent())
 
     def __post_init__(self) -> None:
@@ -151,6 +165,8 @@ class ClientConfig:
             raise ConfigError("live_diff_max_days / live_only_window_days must be >= 0")
         if self.rate_limit_wait < 0:
             raise ConfigError("rate_limit_wait must be >= 0")
+        if self.frame_cache_max_entries < 0:
+            raise ConfigError("frame_cache_max_entries must be >= 0 (0 disables the cache)")
         for phase, value in (
             ("connect_timeout", self.connect_timeout),
             ("read_timeout", self.read_timeout),
@@ -202,6 +218,7 @@ class ClientConfig:
         live_diff_max_days: int | None = None,
         live_only_window_days: int | None = None,
         rate_limit_wait: float | None = None,
+        frame_cache_max_entries: int | None = None,
     ) -> ClientConfig:
         resolved_key = api_key or os.environ.get(_ENV_API_KEY) or ""
         if not resolved_key:
@@ -269,6 +286,11 @@ class ClientConfig:
             rate_limit_wait=_float_env(
                 _ENV_RATE_LIMIT_WAIT, rate_limit_wait, DEFAULT_RATE_LIMIT_WAIT
             ),
+            frame_cache_max_entries=_int_env(
+                _ENV_FRAME_CACHE_MAX_ENTRIES,
+                frame_cache_max_entries,
+                DEFAULT_FRAME_CACHE_MAX_ENTRIES,
+            ),
         )
 
 
@@ -329,6 +351,7 @@ __all__ = [
     "DEFAULT_CACHE_MAX_BYTES",
     "DEFAULT_CONNECT_TIMEOUT",
     "DEFAULT_DOWNLOAD_CONCURRENCY",
+    "DEFAULT_FRAME_CACHE_MAX_ENTRIES",
     "DEFAULT_LIVE_DIFF_MAX_DAYS",
     "DEFAULT_LIVE_ONLY_WINDOW_DAYS",
     "DEFAULT_MAX_CONNECTIONS",
