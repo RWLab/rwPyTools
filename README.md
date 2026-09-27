@@ -245,6 +245,18 @@ client.download("binance_spot_1h")                 # just make sure it is on dis
 client.download("fx_daily", symbol="EURUSD")
 ```
 
+A cache hit above still means `get()` re-reads and re-filters that file from
+disk into a fresh DataFrame — for a dataset with no `Template.YEAR`
+partitioning (a single export spanning its whole date range, e.g.
+`liquid_universe_prices`), that's the *entire* export, every call, regardless
+of how narrow `start`/`end` are. A **separate**, smaller in-memory LRU
+(`RWPYTOOLS_FRAME_CACHE_MAX_ENTRIES`, default 8) returns the identical
+already-parsed-and-filtered result instead when a call repeats an earlier one
+exactly — useful for retrying after a partial failure, or for a caller that
+iterates windows itself to bound its own memory. It's keyed by the export's
+own on-disk identity plus the request shape, so it can never return stale or
+mismatched data, and `frame_cache_max_entries=0` disables it.
+
 ## Errors
 
 ```python
@@ -292,6 +304,7 @@ Every setting takes a constructor argument or an environment variable
 | `RWPYTOOLS_RATE_LIMIT_WAIT` | 20 | Seconds per retry after a 429 without `Retry-After` |
 | `RWPYTOOLS_MAX_RETRIES` | 3 | Retry attempts |
 | `RWPYTOOLS_DOWNLOAD_CONCURRENCY` | 8 | Parallel downloads / live requests |
+| `RWPYTOOLS_FRAME_CACHE_MAX_ENTRIES` | 8 | In-memory LRU size for parsed-and-filtered `get()` results per client (0 disables) |
 | `RWPYTOOLS_REQUEST_TIMEOUT` | 30 | Umbrella HTTP timeout (per-phase overrides exist) |
 | `RWPYTOOLS_NO_PROMPT` | — | Set to disable the interactive key prompt |
 

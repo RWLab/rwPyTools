@@ -184,6 +184,90 @@ def test_cached_export_is_used_without_any_api_call(
 
 
 @respx.mock(base_url=FAKE_API, assert_all_called=False)
+def test_repeated_identical_request_reads_the_export_only_once(
+    respx_mock: respx.MockRouter, client: Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A caller repeating an identical (dataset, window, symbols) request --
+    retrying after a partial failure, or iterating windows itself to bound
+    its own memory -- must not pay to re-read and re-filter the same
+    on-disk export twice in one process. This is a separate cost from the
+    signed-URL/API call `test_cached_export_is_used_without_any_api_call`
+    already covers: that test shows the *network* call isn't repeated; this
+    one shows the *parse* isn't either."""
+    import rwpytools.formats as formats_module
+
+    _mock_vix(respx_mock)
+    real_read_frame = formats_module.read_frame
+    calls: list[Any] = []
+
+    def _counting_read_frame(*args: Any, **kwargs: Any) -> pd.DataFrame:
+        calls.append((args, kwargs))
+        return real_read_frame(*args, **kwargs)
+
+    monkeypatch.setattr(formats_module, "read_frame", _counting_read_frame)
+
+    first = client.get("vix", source="bulk")
+    second = client.get("vix", source="bulk")
+
+    assert len(calls) == 1
+    pd.testing.assert_frame_equal(first.df, second.df)
+
+
+@respx.mock(base_url=FAKE_API, assert_all_called=False)
+def test_frame_cache_discriminates_by_request_shape(
+    respx_mock: respx.MockRouter, client: Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A genuinely different request (different symbols here) must still
+    read/filter fresh -- the cache must never return another request's
+    result."""
+    import rwpytools.formats as formats_module
+
+    _mock_vix(respx_mock)
+    real_read_frame = formats_module.read_frame
+    calls: list[Any] = []
+
+    def _counting_read_frame(*args: Any, **kwargs: Any) -> pd.DataFrame:
+        calls.append(kwargs)
+        return real_read_frame(*args, **kwargs)
+
+    monkeypatch.setattr(formats_module, "read_frame", _counting_read_frame)
+
+    vix_only = client.get("vix", source="bulk", symbols=["VIX"])
+    vix3m_only = client.get("vix", source="bulk", symbols=["VIX3M"])
+
+    assert len(calls) == 2
+    assert set(vix_only.df["ticker"]) == {"VIX"}
+    assert set(vix3m_only.df["ticker"]) == {"VIX3M"}
+
+
+@respx.mock(base_url=FAKE_API, assert_all_called=False)
+def test_frame_cache_max_entries_zero_disables_it(
+    respx_mock: respx.MockRouter, config: ClientConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import rwpytools.formats as formats_module
+
+    _mock_vix(respx_mock)
+    real_read_frame = formats_module.read_frame
+    calls: list[Any] = []
+
+    def _counting_read_frame(*args: Any, **kwargs: Any) -> pd.DataFrame:
+        calls.append(kwargs)
+        return real_read_frame(*args, **kwargs)
+
+    monkeypatch.setattr(formats_module, "read_frame", _counting_read_frame)
+
+    disabled = Client(config=config.with_overrides(frame_cache_max_entries=0))
+    disabled._stack.session._today = lambda: TODAY
+    try:
+        disabled.get("vix", source="bulk")
+        disabled.get("vix", source="bulk")
+    finally:
+        disabled.close()
+
+    assert len(calls) == 2  # no caching at all: read fresh every time, as before this feature
+
+
+@respx.mock(base_url=FAKE_API, assert_all_called=False)
 def test_source_bulk_never_calls_live(respx_mock: respx.MockRouter, client: Client) -> None:
     _files, live = _mock_vix(respx_mock)
     result = client.get("vix", source="bulk")
