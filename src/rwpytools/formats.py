@@ -42,14 +42,18 @@ Filtered reads
 --------------
 
 :func:`read_frame` narrows by date range and symbol while reading. For the
-Arrow formats the predicate runs on the Arrow table *before* pandas
-conversion, so ``symbols=["BTCUSDT"]`` against a 20M-row export only ever
-materialises BTCUSDT's rows. :func:`max_timestamp` finds an export's
-watermark by reading just its date column.
+Arrow formats the predicate is pushed into a batch-by-batch dataset scan,
+so ``start="2024-01-01", symbols=["BTCUSDT"]`` against a 20M-row export
+never holds more than the matching rows plus one record batch — the whole
+export is never materialised. :func:`max_timestamp` finds an export's
+watermark by reading just its date column. After each read, Arrow's
+allocator is asked to return freed memory to the OS
+(:func:`release_arrow_memory`), so long-running processes do not ratchet up.
 """
 
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import enum
 import logging
@@ -61,6 +65,7 @@ from typing import Any, Literal
 import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
+import pyarrow.dataset as ds
 import pyarrow.feather
 import pyarrow.parquet
 
@@ -344,8 +349,8 @@ def _arrow_bound(column_type: Any, day: _dt.date) -> Any:
     return None
 
 
-def _filter_table(
-    table: Any,
+def _filter_expression(
+    schema: Any,
     *,
     date_column: str | None,
     start: _dt.date | None,
@@ -353,48 +358,107 @@ def _filter_table(
     symbol_column: str | None,
     symbols: Sequence[str] | None,
 ) -> tuple[Any, bool]:
-    """Apply what filters Arrow can evaluate natively.
+    """Translate the date / symbol filters into an Arrow dataset expression.
 
-    Returns ``(table, fully_filtered)``; when ``fully_filtered`` is False
-    the caller finishes the job in pandas (e.g. dictionary-encoded symbols
-    or a date column stored in an unusual type).
+    Returns ``(expression, complete)``. ``expression`` is ``None`` when no
+    filter applies to this schema. ``complete`` is False when some filter
+    could not be expressed (e.g. a dictionary-encoded symbol column or a
+    date column in an unusual type); the caller then finishes the job in
+    pandas, so the result is always fully filtered.
     """
 
     complete = True
-    mask: Any = None
+    expression: Any = None
 
     def _and(clause: Any) -> None:
-        nonlocal mask
-        mask = clause if mask is None else pc.and_(mask, clause)
+        nonlocal expression
+        expression = clause if expression is None else (expression & clause)
 
-    if symbols and symbol_column and symbol_column in table.column_names:
-        column = table[symbol_column]
-        try:
-            value_set = pa.array(list(symbols)).cast(column.type)
-            _and(pc.is_in(column, value_set=value_set))
-        except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError):
+    names = set(schema.names)
+    if symbols and symbol_column and symbol_column in names:
+        column_type = schema.field(symbol_column).type
+        if pa.types.is_dictionary(column_type):
             complete = False
+        else:
+            try:
+                value_set = pa.array(list(symbols)).cast(column_type)
+                _and(pc.field(symbol_column).isin(value_set))
+            except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError):
+                complete = False
 
-    if (start is not None or end is not None) and date_column and date_column in table.column_names:
-        column = table[date_column]
-        try:
-            if start is not None:
-                low = _arrow_bound(column.type, start)
-                if low is None:
-                    raise pa.ArrowNotImplementedError(str(column.type))
-                _and(pc.greater_equal(column, low))
-            if end is not None:
-                high = _arrow_bound(column.type, end + _dt.timedelta(days=1))
-                if high is None:
-                    raise pa.ArrowNotImplementedError(str(column.type))
-                _and(pc.less(column, high))
-        except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError):
+    if (start is not None or end is not None) and date_column and date_column in names:
+        column_type = schema.field(date_column).type
+        low = _arrow_bound(column_type, start) if start is not None else None
+        high = _arrow_bound(column_type, end + _dt.timedelta(days=1)) if end is not None else None
+        if (start is not None and low is None) or (end is not None and high is None):
             complete = False
+        else:
+            if low is not None:
+                _and(pc.field(date_column) >= low)
+            if high is not None:
+                _and(pc.field(date_column) < high)
 
-    if mask is not None:
-        # Null comparisons yield null; treat them as "not selected".
-        table = table.filter(pc.fill_null(mask, False))
+    return expression, complete
+
+
+def _scan_filtered(
+    path: Path,
+    fmt: DataFormat,
+    *,
+    date_column: str | None,
+    start: _dt.date | None,
+    end: _dt.date | None,
+    symbol_column: str | None,
+    symbols: Sequence[str] | None,
+    memory_pool: Any = None,
+) -> tuple[Any, bool] | None:
+    """Scan an Arrow-format export with the filter pushed into the scan.
+
+    The file is read record batch by record batch and each batch is
+    filtered as it is decoded, so peak memory is the *matching* rows plus
+    one batch — never the whole export. That is what keeps a narrow
+    ``start`` / ``end`` cheap on a multi-GB file, on the first read and on
+    every different window after it.
+
+    Returns ``(table, complete)``, or ``None`` when the file cannot be
+    scanned as a dataset (Feather V1, which the per-pair FX exports use, is
+    not an Arrow IPC file) and the caller must fall back to a full read.
+    """
+
+    try:
+        dataset = ds.dataset(str(path), format="ipc" if fmt is DataFormat.FEATHER else "parquet")
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError, OSError):
+        return None
+    expression, complete = _filter_expression(
+        dataset.schema,
+        date_column=date_column,
+        start=start,
+        end=end,
+        symbol_column=symbol_column,
+        symbols=symbols,
+    )
+    try:
+        table = dataset.to_table(filter=expression, memory_pool=memory_pool)
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError):
+        # An expression the scanner rejects for this file: read it all and
+        # let pandas filter instead.
+        table = dataset.to_table(memory_pool=memory_pool)
+        complete = False
     return table, complete
+
+
+def release_arrow_memory() -> None:
+    """Return Arrow's freed-but-cached memory to the operating system.
+
+    Arrow's allocator (jemalloc / mimalloc) keeps freed memory for reuse, so
+    after reading a large export a process's RSS stays near its peak even
+    once every table is gone — and a long-running worker that reads export
+    after export ratchets upward until it hits its memory limit. Called
+    after every read of a cached export.
+    """
+
+    with contextlib.suppress(AttributeError, NotImplementedError):
+        pa.default_memory_pool().release_unused()
 
 
 def _read_arrow_table(path: Path, fmt: DataFormat, columns: Sequence[str] | None = None) -> Any:
@@ -419,25 +483,38 @@ def read_frame(
 
     With no filters this is :func:`read_auto`. ``end`` is inclusive of the
     whole day, so an intraday column keeps every bar on ``end``.
+
+    Feather (Arrow IPC) and parquet exports are scanned with the filter
+    pushed down (see :func:`_scan_filtered`), so memory scales with the
+    rows returned rather than with the size of the export.
     """
 
     fmt = detect_format(object_name)
     filtering = bool(symbols) or start is not None or end is not None
-    if not filtering:
-        return read(path, fmt, max_bytes=max_bytes)
-    _check_memory_guard(path, max_bytes=max_bytes)
-    kwargs: dict[str, Any] = {
-        "date_column": date_column,
-        "start": start,
-        "end": end,
-        "symbol_column": symbol_column,
-        "symbols": symbols,
-    }
-    if fmt in (DataFormat.FEATHER, DataFormat.PARQUET):
-        table, complete = _filter_table(_read_arrow_table(path, fmt), **kwargs)
-        frame = _arrow_to_df(table)
-        return frame if complete else filter_frame(frame, **kwargs)
-    return filter_frame(_BY_FORMAT[fmt].reader(path), **kwargs)
+    try:
+        if not filtering:
+            return read(path, fmt, max_bytes=max_bytes)
+        _check_memory_guard(path, max_bytes=max_bytes)
+        kwargs: dict[str, Any] = {
+            "date_column": date_column,
+            "start": start,
+            "end": end,
+            "symbol_column": symbol_column,
+            "symbols": symbols,
+        }
+        if fmt in (DataFormat.FEATHER, DataFormat.PARQUET):
+            scanned = _scan_filtered(path, fmt, **kwargs)
+            if scanned is None:  # Feather V1: no batch index, read it whole
+                table = _read_arrow_table(path, fmt)
+                complete = False
+            else:
+                table, complete = scanned
+            frame = _arrow_to_df(table)
+            del table
+            return frame if complete else filter_frame(frame, **kwargs)
+        return filter_frame(_BY_FORMAT[fmt].reader(path), **kwargs)
+    finally:
+        release_arrow_memory()
 
 
 def max_timestamp(path: Path, *, object_name: str, column: str) -> pd.Timestamp | None:
@@ -455,6 +532,8 @@ def max_timestamp(path: Path, *, object_name: str, column: str) -> pd.Timestamp 
         except (KeyError, pa.ArrowInvalid):
             return None
         series = _arrow_to_df(table)[column]
+        del table
+        release_arrow_memory()
     else:
         compression: CsvCompression = "gzip" if fmt is DataFormat.CSV_GZ else None
         try:
@@ -535,5 +614,6 @@ __all__ = [
     "read_frame",
     "read_head",
     "register_dtype_hints",
+    "release_arrow_memory",
     "to_timestamps",
 ]

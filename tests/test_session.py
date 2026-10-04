@@ -690,3 +690,115 @@ def test_snapshot_export_is_served_from_cache_without_replanning_a_download(
     assert not live.called
     assert again.route.bulk_action is not None and again.route.bulk_action.value == "cache"
     assert "no date watermark" in again.route.reason
+
+
+# ---- results are never shared between calls ------------------------------------------
+#
+# Each get() must return data read fresh for that call. Any in-memory reuse of
+# a parsed export (e.g. an LRU of DataFrames) has to keep these passing: the
+# seam refresh writes live values into the bulk half in place, and callers
+# are free to mutate the frame they are handed.
+
+
+def _mock_provisional_prices(respx_mock: respx.MockRouter) -> None:
+    table = pa.table(
+        {
+            "ticker": ["HBM", "HBM"],
+            "date": pa.array([dt.date(2026, 9, 21), dt.date(2026, 9, 22)], pa.date32()),
+            "close": [27.0, 27.5],
+            "volume": [4_000_000.0, 3_176_000.0],
+        }
+    )
+    buf = io.BytesIO()
+    pyarrow.feather.write_feather(table, buf)
+    _mock_file(
+        respx_mock,
+        namespace="equities",
+        dataset="statarb",
+        schema="prices",
+        bucket="equity_factors_research_pod",
+        obj="statarb/prices.feather",
+        payload=buf.getvalue(),
+        fmt="feather",
+    )
+    respx_mock.get("/v1/equities/statarb/prices").respond(
+        json=_page([{"ticker": "HBM", "date": "2026-09-22", "close": 27.74, "volume": 5_836_000.0}])
+    )
+
+
+@respx.mock(base_url=FAKE_API, assert_all_called=False)
+def test_a_bulk_only_read_is_never_changed_by_an_earlier_live_top_up(
+    respx_mock: respx.MockRouter, client: Client
+) -> None:
+    _mock_provisional_prices(respx_mock)
+    topped_up = client.get("statarb_prices")
+    assert topped_up.seam_updates == 1  # live values were applied to that result...
+
+    # ...but the export itself, read again for the same window, is untouched.
+    bulk = client.get("statarb_prices", end="2026-09-22", source="bulk").df
+    assert bulk["volume"].tolist() == [4_000_000.0, 3_176_000.0]
+    assert bulk["close"].tolist() == [27.0, 27.5]
+
+
+@respx.mock(base_url=FAKE_API, assert_all_called=False)
+def test_mutating_a_result_never_changes_the_next_one(
+    respx_mock: respx.MockRouter, client: Client
+) -> None:
+    _mock_provisional_prices(respx_mock)
+    first = client.get("statarb_prices", source="bulk")
+    first.df.loc[0, "close"] = -1.0
+    first.df["extra"] = 1
+    first.df.sort_values("close", ascending=False, inplace=True)
+
+    second = client.get("statarb_prices", source="bulk")
+    assert second.df["close"].tolist() == [27.0, 27.5]
+    assert "extra" not in second.df.columns
+    assert second.df is not first.df
+
+
+@respx.mock(base_url=FAKE_API, assert_all_called=False)
+def test_windowed_gets_scan_the_export_instead_of_loading_it(
+    respx_mock: respx.MockRouter, client: Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end: a year-by-year backfill through Client.get() never reads a
+    whole non-templated export into memory (only the one-column watermark
+    scan touches every row)."""
+
+    import rwpytools.formats as formats_module
+
+    days = pd.bdate_range("2015-01-01", "2018-12-31")
+    table = pa.table(
+        {
+            "ticker": ["AAPL"] * len(days) + ["MSFT"] * len(days),
+            "date": pa.array(list(days.date) * 2, pa.date32()),
+            "close": list(range(len(days) * 2)),
+        }
+    )
+    buf = io.BytesIO()
+    pyarrow.feather.write_feather(table, buf, chunksize=100)
+    _mock_file(
+        respx_mock,
+        namespace="equities",
+        dataset="equity.factors",
+        schema="prices",
+        bucket="equity_factors_research_pod",
+        obj="equity_factors/prices.feather",
+        payload=buf.getvalue(),
+        fmt="feather",
+    )
+    real = formats_module._read_arrow_table
+
+    def _only_single_columns(path: Any, fmt: Any, columns: Any = None) -> Any:
+        assert columns is not None and len(columns) == 1, "a whole export was loaded"
+        return real(path, fmt, columns)
+
+    monkeypatch.setattr(formats_module, "_read_arrow_table", _only_single_columns)
+
+    rows = 0
+    for year in range(2015, 2019):
+        result = client.get(
+            "liquid_universe_prices", start=f"{year}-01-01", end=f"{year}-12-31", source="bulk"
+        )
+        assert set(pd.to_datetime(result.df["date"]).dt.year) == {year}
+        rows += len(result)
+    assert rows == len(days) * 2
