@@ -237,6 +237,14 @@ never served as a cache hit. Eviction is LRU by fetch time against a 10 GiB
 budget (`RWPYTOOLS_CACHE_MAX_BYTES`). The cache is thread-safe within a
 process; it is not coordinated across processes.
 
+Reading a cached export is memory-bounded: `start`, `end` and `symbols` are
+pushed into a batch-by-batch scan of feather and parquet exports, so a narrow
+window over a multi-GB export holds only the matching rows, never the whole
+file. Iterating a large export one window at a time (e.g. a year-by-year
+backfill of `liquid_universe_prices`) therefore stays flat, and freed Arrow
+memory is returned to the OS after every read so long-running workers do not
+ratchet up. The per-pair FX exports (Feather V1) are small and read whole.
+
 ```python
 client.cache.total_bytes()
 client.cache.entries()
