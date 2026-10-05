@@ -26,6 +26,11 @@ from rwpytools import formats
 from rwpytools.errors import RwPyToolsError
 from rwpytools.formats import DataFormat, filter_frame, read_auto, read_frame
 
+#: Metered pools must outlive every buffer allocated from them; see the
+#: memory-bound test. (The library itself always uses Arrow's process-wide
+#: default pool, so it has no such lifetime hazard.)
+_METERED_POOLS: list[Any] = []
+
 N_TICKERS = 200
 N_DAYS = 2_000  # 400k rows
 
@@ -84,6 +89,10 @@ def test_a_narrow_window_never_loads_the_whole_export(export_dir: Path) -> None:
 
     def peak(**filters: Any) -> tuple[int, int]:
         pool = pa.proxy_memory_pool(pa.system_memory_pool())
+        # The scanner's background read-ahead can still release buffers to
+        # this pool after the scan returns; a pool destroyed first crashes the
+        # interpreter later, in some unrelated test. Keep it for the process.
+        _METERED_POOLS.append(pool)
         scanned = formats._scan_filtered(
             path,
             DataFormat.FEATHER,
